@@ -14,87 +14,44 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# ========= 选择安装类型 =========
+echo -e "${GREEN}==================================================${NC}"
+echo -e "${GREEN}请选择要安装的节点类型：${NC}"
+echo -e "${GREEN}==================================================${NC}"
+echo "1) VLESS + Reality（无需域名，伪装网站）"
+echo "2) VMess + WebSocket + TLS（需要域名、申请证书）"
+echo ""
+read -p "请选择 [1-2] (默认: 1): " INSTALL_TYPE
+INSTALL_TYPE=${INSTALL_TYPE:-1}
+
 # ========= 安装必需的软件包 =========
 echo -e "${GREEN}安装必需的软件包...${NC}"
 apt update
-apt install -y curl socat lsof unzip
+apt install -y curl socat lsof unzip openssl
 
-# ========= 检查并释放 80 端口 =========
-echo -e "${GREEN}检查 80 端口是否被占用...${NC}"
-if lsof -i :80 > /dev/null 2>&1; then
-  echo -e "${YELLOW}80 端口已被占用，尝试释放...${NC}"
-  
-  # 停止 nginx 服务（如果存在）
-  if systemctl is-active --quiet nginx 2>/dev/null; then
-    echo "停止 nginx 服务..."
-    systemctl stop nginx
-  fi
-  
-  # 停止 apache 服务（如果存在）
-  if systemctl is-active --quiet apache2 2>/dev/null; then
-    echo "停止 apache2 服务..."
-    systemctl stop apache2
-  fi
+# ========= 检查并启用 BBR + FQ（所有类型都启用） =========
+echo -e "${GREEN}>>> 检查 BBR + FQ 状态...${NC}"
 
-  # 强制释放 80 端口
-  echo "强制释放 80 端口..."
-  fuser -k 80/tcp 2>/dev/null || true
-  sleep 2
-fi
+CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+CURRENT_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
 
-# ========= 安装 ACME.sh =========
-echo -e "${GREEN}安装 ACME.sh...${NC}"
-if [ ! -f ~/.acme.sh/acme.sh ]; then
-  curl https://get.acme.sh | sh
+if [[ "$CURRENT_CC" == "bbr" && "$CURRENT_QDISC" == "fq" ]]; then
+  echo -e "${GREEN}BBR + FQ 已启用，跳过设置${NC}"
 else
-  echo "ACME.sh 已安装，跳过..."
+  echo -e "${YELLOW}未启用 BBR + FQ，正在设置...${NC}"
+
+  modprobe tcp_bbr || true
+
+  cat > /etc/sysctl.d/99-xray-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+  sysctl --system
 fi
 
-# ========= 使用 ZeroSSL（避免 Let's Encrypt 速率限制） =========
-echo -e "${GREEN}使用 ZeroSSL 作为证书提供商${NC}"
-~/.acme.sh/acme.sh --set-default-ca --server zerossl
-
-# ========= 手动输入域名 =========
-echo -e "${GREEN}=======================${NC}"
-read -p "请输入要申请证书的域名: " DOMAIN
-if [ -z "$DOMAIN" ]; then
-  echo -e "${RED}域名不能为空，请重新运行脚本并输入有效的域名。${NC}"
-  exit 1
-fi
-
-# 注册邮箱（使用域名作为默认邮箱）
-EMAIL="admin@${DOMAIN}"
-echo -e "${GREEN}使用邮箱: $EMAIL 注册 ZeroSSL${NC}"
-~/.acme.sh/acme.sh --register-account -m $EMAIL --server zerossl || true
-
-# ========= 申请证书 =========
-echo -e "${GREEN}申请证书: $DOMAIN${NC}"
-if ! ~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone -k ec-256 --force --insecure; then
-  echo -e "${RED}证书申请失败！${NC}"
-  echo -e "${YELLOW}请检查：${NC}"
-  echo "1. 域名 DNS 解析是否正确"
-  echo "2. 端口 80 是否可用"
-  echo "3. 是否超过速率限制"
-  exit 1
-fi
-
-# ========= 安装证书到指定路径（用域名命名） =========
-# 创建证书目录
-CERT_DIR="/kimssl"
-if [ ! -d "$CERT_DIR" ]; then
-  echo "目录 $CERT_DIR 不存在，正在创建..."
-  mkdir -p $CERT_DIR
-fi
-
-# 将证书文件安装到指定路径，用域名命名
-echo "安装证书到 $CERT_DIR/，用域名命名..."
-~/.acme.sh/acme.sh --install-cert -d $DOMAIN --ecc \
-  --key-file $CERT_DIR/${DOMAIN}.key \
-  --fullchain-file $CERT_DIR/${DOMAIN}.crt
-
-# 设置证书和私钥文件的权限
-echo "设置证书和私钥文件的权限..."
-chmod 644 $CERT_DIR/${DOMAIN}.crt $CERT_DIR/${DOMAIN}.key
+echo -e "${GREEN}当前拥塞控制算法: $(sysctl -n net.ipv4.tcp_congestion_control)${NC}"
+echo -e "${GREEN}当前队列算法    : $(sysctl -n net.core.default_qdisc)${NC}"
 
 # ========= 安装 Xray =========
 echo -e "${GREEN}安装 Xray...${NC}"
@@ -107,36 +64,234 @@ if ! command -v xray &> /dev/null; then
 fi
 echo -e "${GREEN}Xray 安装成功！${NC}"
 
-# ========= VMess UUID 和 WebSocket Path 设置 =========
-UUID=$(cat /proc/sys/kernel/random/uuid)
-# 生成随机 WebSocket Path（使用12位随机字符串）
-WS_PATH=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
+# ========= 根据安装类型执行不同逻辑 =========
+if [ "$INSTALL_TYPE" -eq 1 ]; then
+  # ========= VLESS + Reality 安装 =========
+  
+  # ========= 端口设置 =========
+  read -p "请输入 Xray Reality 端口（默认 443，不懂就回车）: " INPUT_PORT
+  if [ -z "$INPUT_PORT" ]; then
+    XRAY_PORT=443
+  else
+    XRAY_PORT=$INPUT_PORT
+  fi
 
-# ========= 手动输入端口 =========
-echo -e "${GREEN}=======================${NC}"
-read -p "请输入要使用的端口 (默认: 8443): " XRAY_PORT
-if [ -z "$XRAY_PORT" ]; then
-  XRAY_PORT=8443
-  echo -e "${GREEN}使用默认端口: $XRAY_PORT${NC}"
-else
-  echo -e "${GREEN}使用端口: $XRAY_PORT${NC}"
-fi
+  # ========= Reality 域名设置 =========
+  read -p "请输入 Reality 伪装域名（默认 www.icloud.com，不懂就回车）: " INPUT_DOMAIN
+  if [ -z "$INPUT_DOMAIN" ]; then
+    DEST_DOMAIN="www.icloud.com"
+    SERVER_NAME="www.icloud.com"
+  else
+    DEST_DOMAIN="$INPUT_DOMAIN"
+    SERVER_NAME="$INPUT_DOMAIN"
+  fi
 
-# ========= Xray 配置文件生成（使用域名命名的证书） =========
-echo -e "${GREEN}生成 Xray 配置文件...${NC}"
-cat > /usr/local/etc/xray/config.json <<EOF
+  # ========= 生成 UUID 和 Reality 密钥 =========
+  UUID=$(xray uuid)
+  
+  KEYS=$(xray x25519)
+  PRIVATE_KEY=$(echo "$KEYS" | grep '^PrivateKey:' | cut -d':' -f2 | tr -d ' ')
+  PUBLIC_KEY=$(echo "$KEYS" | grep '^Password:' | cut -d':' -f2 | tr -d ' ')
+
+  SHORT_ID_LEN_BYTES=$((RANDOM % 6 + 3))
+  SHORT_ID=$(openssl rand -hex "$SHORT_ID_LEN_BYTES")
+  SHORT_IDS_JSON="[\"\", \"$SHORT_ID\"]"
+
+  # ========= 生成 Xray 配置（VLESS Reality） =========
+  cat > /usr/local/etc/xray/config.json <<EOF
 {
-  "log": {
-    "loglevel": "warning"
-  },
+  "log": {"loglevel": "warning"},
+  "dns": {"servers": ["8.8.8.8", "1.1.1.1"]},
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {
-        "type": "field",
-        "ip": ["geoip:private"],
-        "outboundTag": "block"
+      {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
+      {"type": "field", "domain": ["geosite:apple", "geosite:microsoft"], "outboundTag": "direct"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
+      {"type": "field", "port": "443", "network": "udp", "outboundTag": "block"},
+      {"type": "field", "network": "udp,tcp", "outboundTag": "direct"}
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $XRAY_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "$DEST_DOMAIN:443",
+          "xver": 0,
+          "serverNames": ["$SERVER_NAME"],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": $SHORT_IDS_JSON
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
       }
+    }
+  ],
+  "outbounds": [
+    {"protocol": "blackhole", "tag": "block"},
+    {"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}, "tag": "direct"}
+  ]
+}
+EOF
+
+  # ========= 获取服务器 IP 和生成链接 =========
+  SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ip.sb)
+  VLESS_LINK="vless://${UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SERVER_NAME}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#KIM@vless-reality-vison"
+
+  # ========= 输出 =========
+  clear
+  echo -e "${GREEN}==================================================${NC}"
+  echo -e "${GREEN}        Xray VLESS + Reality 安装完成${NC}"
+  echo -e "${GREEN}==================================================${NC}"
+  echo ""
+  echo -e "${YELLOW}服务器信息：${NC}"
+  echo -e "  服务器IP : ${GREEN}${SERVER_IP}${NC}"
+  echo -e "  端口     : ${GREEN}${XRAY_PORT}${NC}"
+  echo -e "  UUID     : ${GREEN}${UUID}${NC}"
+  echo -e "  Reality 公钥 : ${GREEN}${PUBLIC_KEY}${NC}"
+  echo -e "  shortId  : ${GREEN}${SHORT_ID}${NC}"
+  echo -e "  SNI      : ${GREEN}${SERVER_NAME}${NC}"
+  echo -e "  flow     : ${GREEN}xtls-rprx-vision${NC}"
+  echo ""
+  echo -e "${BLUE}VLESS 链接：${NC}"
+  echo "$VLESS_LINK"
+  echo ""
+  echo -e "${GREEN}==================================================${NC}"
+  echo -e "${YELLOW}服务管理命令：${NC}"
+  echo -e "  查看状态：systemctl status xray"
+  echo -e "  查看日志：journalctl -u xray -n 50 -f"
+  echo -e "  重启服务：systemctl restart xray"
+  echo -e "${GREEN}==================================================${NC}"
+
+  # ========= 保存配置 =========
+  cat > ./xray_info.txt <<EOF
+========== Xray VLESS Reality 配置信息 ==========
+服务器IP: $SERVER_IP
+端口: $XRAY_PORT
+UUID: $UUID
+Reality 公钥: $PUBLIC_KEY
+shortId: $SHORT_ID
+SNI: $SERVER_NAME
+flow: xtls-rprx-vision
+
+【节点链接】
+$VLESS_LINK
+=================================================
+EOF
+
+else
+  # ========= VMess + WS + TLS 安装 =========
+  
+  # ========= 检查并释放 80 端口 =========
+  echo -e "${GREEN}检查 80 端口是否被占用...${NC}"
+  if lsof -i :80 > /dev/null 2>&1; then
+    echo -e "${YELLOW}80 端口已被占用，尝试释放...${NC}"
+    
+    # 停止 nginx 服务（如果存在）
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      echo "停止 nginx 服务..."
+      systemctl stop nginx
+    fi
+    
+    # 停止 apache 服务（如果存在）
+    if systemctl is-active --quiet apache2 2>/dev/null; then
+      echo "停止 apache2 服务..."
+      systemctl stop apache2
+    fi
+
+    # 强制释放 80 端口
+    echo "强制释放 80 端口..."
+    fuser -k 80/tcp 2>/dev/null || true
+    sleep 2
+  fi
+
+  # ========= 安装 ACME.sh =========
+  echo -e "${GREEN}安装 ACME.sh...${NC}"
+  if [ ! -f ~/.acme.sh/acme.sh ]; then
+    curl https://get.acme.sh | sh
+  else
+    echo "ACME.sh 已安装，跳过..."
+  fi
+
+  # ========= 使用 ZeroSSL =========
+  echo -e "${GREEN}使用 ZeroSSL 作为证书提供商${NC}"
+  ~/.acme.sh/acme.sh --set-default-ca --server zerossl
+
+  # ========= 手动输入域名 =========
+  echo -e "${GREEN}=======================${NC}"
+  read -p "请输入要申请证书的域名: " DOMAIN
+  if [ -z "$DOMAIN" ]; then
+    echo -e "${RED}域名不能为空，请重新运行脚本并输入有效的域名。${NC}"
+    exit 1
+  fi
+
+  # 注册邮箱
+  EMAIL="admin@${DOMAIN}"
+  echo -e "${GREEN}使用邮箱: $EMAIL 注册 ZeroSSL${NC}"
+  ~/.acme.sh/acme.sh --register-account -m $EMAIL --server zerossl || true
+
+  # ========= 申请证书 =========
+  echo -e "${GREEN}申请证书: $DOMAIN${NC}"
+  if ! ~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone -k ec-256 --force --insecure; then
+    echo -e "${RED}证书申请失败！${NC}"
+    echo -e "${YELLOW}请检查：${NC}"
+    echo "1. 域名 DNS 解析是否正确"
+    echo "2. 端口 80 是否可用"
+    echo "3. 是否超过速率限制"
+    exit 1
+  fi
+
+  # ========= 安装证书 =========
+  CERT_DIR="/kimssl"
+  if [ ! -d "$CERT_DIR" ]; then
+    echo "目录 $CERT_DIR 不存在，正在创建..."
+    mkdir -p $CERT_DIR
+  fi
+
+  echo "安装证书到 $CERT_DIR/，用域名命名..."
+  ~/.acme.sh/acme.sh --install-cert -d $DOMAIN --ecc \
+    --key-file $CERT_DIR/${DOMAIN}.key \
+    --fullchain-file $CERT_DIR/${DOMAIN}.crt
+
+  chmod 644 $CERT_DIR/${DOMAIN}.crt $CERT_DIR/${DOMAIN}.key
+
+  # ========= 生成 UUID 和 WebSocket Path =========
+  UUID=$(cat /proc/sys/kernel/random/uuid)
+  WS_PATH=$(head /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 12)
+
+  # ========= 手动输入端口 =========
+  echo -e "${GREEN}=======================${NC}"
+  read -p "请输入要使用的端口 (默认: 8443): " XRAY_PORT
+  if [ -z "$XRAY_PORT" ]; then
+    XRAY_PORT=8443
+    echo -e "${GREEN}使用默认端口: $XRAY_PORT${NC}"
+  else
+    echo -e "${GREEN}使用端口: $XRAY_PORT${NC}"
+  fi
+
+  # ========= 生成 Xray 配置（VMess） =========
+  cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}
     ]
   },
   "inbounds": [
@@ -145,12 +300,7 @@ cat > /usr/local/etc/xray/config.json <<EOF
       "port": ${XRAY_PORT},
       "protocol": "vmess",
       "settings": {
-        "clients": [
-          {
-            "id": "${UUID}",
-            "alterId": 0
-          }
-        ]
+        "clients": [{"id": "${UUID}", "alterId": 0}]
       },
       "streamSettings": {
         "network": "ws",
@@ -166,98 +316,80 @@ cat > /usr/local/etc/xray/config.json <<EOF
         },
         "wsSettings": {
           "path": "/${WS_PATH}",
-          "headers": {
-            "Host": "${DOMAIN}"
-          }
+          "headers": {"Host": "${DOMAIN}"}
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
     }
   ],
   "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    },
-    {
-      "protocol": "blackhole",
-      "tag": "block"
-    }
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
   ]
 }
 EOF
+  # ========= 生成 VMESS 链接 =========
+  SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 https://ip.sb || curl -s --max-time 5 http://ifconfig.me)
+  
+  base64_encode() {
+    if [[ "$(uname)" == "Darwin" ]]; then
+      echo -n "$1" | base64
+    else
+      echo -n "$1" | base64 -w 0
+    fi
+  }
 
-# 检查配置文件语法
-echo "检查 Xray 配置文件..."
-xray -test -config /usr/local/etc/xray/config.json
+  FIXED_DOMAIN="www.visa.com.sg"
+  VMESS_JSON="{\"v\":\"2\",\"ps\":\"vmess+ws+tls\",\"add\":\"${FIXED_DOMAIN}\",\"port\":\"${XRAY_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/${WS_PATH}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\",\"fp\":\"chrome\"}"
+  VMESS_LINK="vmess://$(base64_encode "$VMESS_JSON")"
 
-# ========= 启动 Xray 服务 =========
-systemctl daemon-reload
-systemctl enable xray
-systemctl restart xray
+  # ========= 重新启动之前停止的 nginx =========
+  echo "检查并恢复 nginx 服务..."
 
-# 等待服务启动
-sleep 3
-
-# 检查服务状态
-if systemctl is-active --quiet xray; then
-  echo -e "${GREEN}Xray 服务启动成功！${NC}"
-else
-  echo -e "${RED}Xray 服务启动失败，请检查日志：journalctl -u xray -n 50${NC}"
-  exit 1
-fi
-
-# ========= 获取服务器 IP =========
-SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org || curl -s --max-time 5 https://ip.sb || curl -s --max-time 5 http://ifconfig.me)
-
-# ========= Base64 编码函数 =========
-base64_encode() {
-  if [[ "$(uname)" == "Darwin" ]]; then
-    echo -n "$1" | base64
-  else
-    echo -n "$1" | base64 -w 0
+  # 重新启动 nginx（如果之前是停止的）
+  if systemctl list-unit-files | grep -q nginx; then
+    if ! systemctl is-active --quiet nginx; then
+      echo "重新启动 nginx..."
+      systemctl start nginx
+      if systemctl is-active --quiet nginx; then
+        echo -e "${GREEN}nginx 已成功重启${NC}"
+      else
+        echo -e "${YELLOW}nginx 启动失败，请手动检查${NC}"
+      fi
+    else
+      echo "nginx 已在运行，无需操作"
+    fi
   fi
-}
 
-# ========= 生成 VMESS 链接） =========
-echo -e "${GREEN}生成 VMESS 链接...${NC}"
+  # ========= 输出 =========
+  clear
+  echo -e "${GREEN}==================================================${NC}"
+  echo -e "${GREEN}        Xray VMess + WebSocket + TLS 安装完成${NC}"
+  echo -e "${GREEN}==================================================${NC}"
+  echo ""
+  echo -e "${YELLOW}服务器信息：${NC}"
+  echo -e "  证书域名 : ${GREEN}${DOMAIN}${NC}"
+  echo -e "  服务器IP : ${GREEN}${SERVER_IP}${NC}"
+  echo -e "  端口     : ${GREEN}${XRAY_PORT}${NC}"
+  echo -e "  UUID     : ${GREEN}${UUID}${NC}"
+  echo -e "  WebSocket Path : ${GREEN}/${WS_PATH}${NC}"
+  echo -e "  证书文件 : ${GREEN}${CERT_DIR}/${DOMAIN}.crt${NC}"
+  echo -e "  密钥文件 : ${GREEN}${CERT_DIR}/${DOMAIN}.key${NC}"
+  echo -e "  TLS指纹  : ${GREEN}chrome${NC}"
+  echo ""
+  echo -e "${BLUE}VMESS 链接：${NC}"
+  echo "$VMESS_LINK"
+  echo ""
+  echo -e "${GREEN}==================================================${NC}"
+  echo -e "${YELLOW}服务管理命令：${NC}"
+  echo -e "  查看状态：systemctl status xray"
+  echo -e "  查看日志：journalctl -u xray -n 50 -f"
+  echo -e "  重启服务：systemctl restart xray"
+  echo -e "${GREEN}==================================================${NC}"
 
-
-FIXED_DOMAIN="www.visa.com.sg"  # 在这里设置你的固定域名
-VMESS_JSON_IP="{\"v\":\"2\",\"ps\":\"vmess+ws+tls\",\"add\":\"${FIXED_DOMAIN}\",\"port\":\"${XRAY_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"/${WS_PATH}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\",\"fp\":\"chrome\"}"
-VMESS_LINK_IP="vmess://$(base64_encode "$VMESS_JSON_IP")"
-
-# ========= 输出信息 =========
-clear
-echo -e "${GREEN}==================================================${NC}"
-echo -e "${GREEN}        Xray VMess + WebSocket + TLS 安装完成${NC}"
-echo -e "${GREEN}==================================================${NC}"
-echo ""
-echo -e "${YELLOW}服务器信息：${NC}"
-echo -e "  证书域名 : ${GREEN}${DOMAIN}${NC}"
-echo -e "  服务器IP : ${GREEN}${SERVER_IP}${NC}"
-echo -e "  端口     : ${GREEN}${XRAY_PORT}${NC}"
-echo -e "  UUID     : ${GREEN}${UUID}${NC}"
-echo -e "  WebSocket Path : ${GREEN}/${WS_PATH}${NC}"
-echo -e "  证书文件 : ${GREEN}${CERT_DIR}/${DOMAIN}.crt${NC}"
-echo -e "  密钥文件 : ${GREEN}${CERT_DIR}/${DOMAIN}.key${NC}"
-echo -e "  TLS指纹  : ${GREEN}chrome${NC}"
-echo "建议使用cdn"
-echo "$VMESS_LINK_IP"
-echo ""
-echo -e "${GREEN}==================================================${NC}"
-echo -e "${YELLOW}服务管理命令：${NC}"
-echo -e "  查看状态：systemctl status xray"
-echo -e "  查看日志：journalctl -u xray -n 50 -f"
-echo -e "  重启服务：systemctl restart xray"
-echo -e "${GREEN}==================================================${NC}"
-
-# ========= 保存配置到文件 =========
-cat > ./xray_info.txt <<EOF
-========== Xray 配置信息 ==========
+  # ========= 保存配置 =========
+  cat > ./xray_info.txt <<EOF
+========== Xray VMess 配置信息 ==========
 证书域名: $DOMAIN
 服务器IP: $SERVER_IP
 端口: $XRAY_PORT
@@ -268,8 +400,23 @@ WebSocket Path: /$WS_PATH
 TLS指纹: chrome
 
 【节点链接】
-$VMESS_LINK_IP
-===================================
+$VMESS_LINK
+=========================================
 EOF
+
+fi
+
+# ========= 启动 Xray 服务 =========
+systemctl daemon-reload
+systemctl enable xray
+systemctl restart xray
+
+sleep 3
+if systemctl is-active --quiet xray; then
+  echo -e "${GREEN}Xray 服务运行正常！${NC}"
+else
+  echo -e "${RED}❌ Xray 启动失败，请检查日志：journalctl -u xray -n 50${NC}"
+  exit 1
+fi
 
 echo -e "${GREEN}配置信息已保存到 ./xray_info.txt${NC}"
