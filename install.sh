@@ -18,7 +18,7 @@ fi
 echo -e "${GREEN}==================================================${NC}"
 echo -e "${GREEN}请选择要安装的节点类型：${NC}"
 echo -e "${GREEN}==================================================${NC}"
-echo "1) VLESS + Reality（无需域名，伪装网站）"
+echo "1) VLESS + Reality+vison（无需域名，伪装网站）"
 echo "2) VMess + WebSocket + TLS（需要域名、申请证书）"
 echo "3) 两种节点共存（VLESS+Reality 和 VMess+WS+TLS）"
 echo ""
@@ -235,7 +235,7 @@ elif [ "$INSTALL_TYPE" -eq 2 ]; then
 
   # ========= 手动输入域名 =========
   echo -e "${GREEN}=======================${NC}"
-  read -p "请输入要申请证书的域名: " DOMAIN
+  read -p "请输入在cloudflae解析好的域名: " DOMAIN
   if [ -z "$DOMAIN" ]; then
     echo -e "${RED}域名不能为空，请重新运行脚本并输入有效的域名。${NC}"
     exit 1
