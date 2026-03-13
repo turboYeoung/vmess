@@ -107,7 +107,6 @@ if [ "$INSTALL_TYPE" -eq 1 ]; then
     "domainStrategy": "IPIfNonMatch",
     "rules": [
       {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
-      {"type": "field", "domain": ["geosite:cn"], "outboundTag": "block"},
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
