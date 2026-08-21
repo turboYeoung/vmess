@@ -110,8 +110,7 @@ if [ "$INSTALL_TYPE" -eq 1 ]; then
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
-      {"type": "field", "port": "443", "network": "udp", "outboundTag": "block"},
-      {"type": "field", "network": "udp,tcp", "outboundTag": "direct"}
+      {"type": "field", "port": "443", "network": "udp", "outboundTag": "block"}
     ]
   },
   "inbounds": [
@@ -143,8 +142,8 @@ if [ "$INSTALL_TYPE" -eq 1 ]; then
     }
   ],
   "outbounds": [
-    {"protocol": "blackhole", "tag": "block"},
-    {"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}, "tag": "direct"}
+    {"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}, "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
   ]
 }
 EOF
@@ -296,8 +295,7 @@ elif [ "$INSTALL_TYPE" -eq 2 ]; then
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
-      {"type": "field", "port": "443", "network": "udp", "outboundTag": "block"},
-      {"type": "field", "network": "udp,tcp", "outboundTag": "direct"}
+      {"type": "field", "port": "443", "network": "udp", "outboundTag": "block"}
     ]
   },
   "inbounds": [
@@ -329,8 +327,8 @@ elif [ "$INSTALL_TYPE" -eq 2 ]; then
     }
   ],
   "outbounds": [
-    {"protocol": "freedom", "tag": "direct"},
-    {"protocol": "blackhole", "tag": "block"}
+    {"protocol": "blackhole", "tag": "block"},
+     {"protocol": "freedom", "tag": "direct"}
   ]
 }
 EOF
@@ -536,8 +534,7 @@ else
       {"type": "field", "domain": ["geosite:apple", "geosite:microsoft"], "outboundTag": "direct"},
       {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
-      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
-      {"type": "field", "network": "udp,tcp", "outboundTag": "direct"}
+      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"}
     ]
   },
   "inbounds": [
